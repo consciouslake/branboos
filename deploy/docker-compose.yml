@@ -22,9 +22,11 @@ services:
 
   # ── Reverse proxy ────────────────────────────────────────────────
   reverse-proxy:
-    # v3.0 mishandles the Docker API version negotiation against newer
-    # Docker Engine releases (26+) — use a current patch instead.
-    image: traefik:v3.3
+    # Pinned patch releases (v3.0, v3.3) bundle an old Docker client that
+    # requests API 1.24 and ignores DOCKER_API_VERSION — newer Docker Engine
+    # (29+, min API 1.44) flat-out rejects that. `latest` carries a current
+    # client that negotiates correctly.
+    image: traefik:latest
     profiles: ["ai-chatbot", "vendor-manager", "crm", "erp", "full"]
     command:
       - "--providers.docker=true"
