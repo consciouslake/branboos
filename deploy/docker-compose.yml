@@ -183,6 +183,12 @@ services:
       dockerfile: Containerfile
       args:
         FRAPPE_BRANCH: version-16
+        # BuildKit's --mount=type=secret does NOT factor secret content into
+        # its cache key, so an identical Containerfile+args build for a
+        # different apps.json will silently reuse the OTHER product's
+        # cached bench-init layer. This arg exists purely to force a
+        # distinct cache key per product — keep it different from ERP's.
+        CACHE_BUST: crm-apps
       secrets:
         - source: crm_apps_json
           target: apps_json
@@ -340,6 +346,9 @@ services:
       dockerfile: Containerfile
       args:
         FRAPPE_BRANCH: version-16
+        # See the matching comment on crm-configurator — must differ from
+        # CRM's value or BuildKit reuses CRM's cached bench-init layer.
+        CACHE_BUST: erp-apps
       secrets:
         - source: erp_apps_json
           target: apps_json
