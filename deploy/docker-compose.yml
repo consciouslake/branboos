@@ -22,26 +22,27 @@ services:
 
   # ── Reverse proxy ────────────────────────────────────────────────
   reverse-proxy:
-    image: traefik:v3.0
+    # v3.0 mishandles the Docker API version negotiation against newer
+    # Docker Engine releases (26+) — use a current patch instead.
+    image: traefik:v3.3
     profiles: ["ai-chatbot", "vendor-manager", "crm", "erp", "full"]
-    environment:
-      # Traefik's Docker client defaults to an old API version that newer
-      # Docker Engine releases (26+) refuse to speak — pin a modern one.
-      - DOCKER_API_VERSION=1.44
     command:
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
       - "--entrypoints.web.address=:80"
       - "--entrypoints.websecure.address=:443"
       - "--certificatesresolvers.le.acme.email=${TRAEFIK_ACME_EMAIL}"
-      - "--certificatesresolvers.le.acme.storage=/acme.json"
+      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
       - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=web"
     ports:
       - "80:80"
       - "443:443"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - traefik-acme:/acme.json
+      # Mount a directory, not the file itself — otherwise Docker creates
+      # acme.json as a directory when it doesn't already exist, and Traefik
+      # can't write its ACME account/cert data into it.
+      - traefik-acme:/letsencrypt
     networks: [branboos-net]
 
   # ── AI Gateway (shared, internal only) ────────────────────────────
