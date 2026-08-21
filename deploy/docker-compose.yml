@@ -13,10 +13,20 @@ networks:
 volumes:
   crm-db-data:
   crm-redis-data:
+  crm-sites:
+  crm-logs:
   erp-db-data:
   erp-redis-data:
+  erp-sites:
+  erp-logs:
   vendor-manager-cache-data:
   traefik-acme:
+
+secrets:
+  crm_apps_json:
+    file: ./frappe/apps-crm.json
+  erp_apps_json:
+    file: ./frappe/apps-erp.json
 
 services:
 
@@ -85,7 +95,7 @@ services:
       - PORT=3000
       - KEYSTONE_URL=http://ai-gateway:8000
       - KEYSTONE_SERVICE_TOKEN=${KEYSTONE_SERVICE_TOKEN}
-      - CRM_API_URL=http://crm-web:8000
+      - CRM_API_URL=http://crm-frontend:8080
       - CRM_API_TOKEN=${CRM_API_TOKEN}
     networks: [branboos-net]
     restart: unless-stopped
@@ -114,7 +124,7 @@ services:
       - PORT=3000
       - KEYSTONE_URL=http://ai-gateway:8000
       - KEYSTONE_SERVICE_TOKEN=${KEYSTONE_SERVICE_TOKEN}
-      - ERP_API_URL=http://erp-web:8000
+      - ERP_API_URL=http://erp-frontend:8080
       - ERP_API_TOKEN=${ERP_API_TOKEN}
       - REDIS_URL=redis://vendor-manager-cache:6379
     networks: [branboos-net]
@@ -135,15 +145,25 @@ services:
     restart: unless-stopped
 
   # ── CRM (Frappe CRM + branboos_crm app) ─────────────────────────
-  # NOTE: adapt from https://github.com/frappe/frappe_docker rather than
-  # building this from scratch — see implementation appendix §5.
-  # This is a minimal skeleton showing the integration points only.
+  # Real image, built from ./frappe (adapted from frappe_docker's
+  # images/custom/Containerfile). apps-crm.json controls which apps get
+  # baked in: frappe/crm + our own branboos-crm on top of it.
+  #
+  # First-time setup after `docker compose --profile crm up -d --build`:
+  # the site doesn't exist until crm-create-site finishes (check its logs
+  # with `docker compose logs -f crm-create-site`) — everything else will
+  # be up but crm-frontend will 500 until that job completes.
 
   crm-db:
     image: mariadb:10.6
     profiles: ["crm", "ai-chatbot", "full"]
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
     environment:
       - MYSQL_ROOT_PASSWORD=${CRM_DB_ROOT_PASSWORD}
+      - MARIADB_ROOT_PASSWORD=${CRM_DB_ROOT_PASSWORD}
     volumes:
       - crm-db-data:/var/lib/mysql
     networks: [branboos-net]
@@ -157,18 +177,93 @@ services:
     networks: [branboos-net]
     restart: unless-stopped
 
-  crm-web:
-    # build: ./crm   (custom image: frappe/crm base + `bench get-app branboos-crm` at build time)
-    image: ghcr.io/branboos/crm:stable   # placeholder — replace with your built image
+  crm-configurator:
+    build:
+      context: ./frappe
+      dockerfile: Containerfile
+      args:
+        FRAPPE_BRANCH: version-16
+      secrets:
+        - source: crm_apps_json
+          target: apps_json
+    image: branboos/crm:latest
     profiles: ["crm", "ai-chatbot", "full"]
-    depends_on: [crm-db, crm-redis]
-    env_file:
-      - path: .env
-        required: false
+    entrypoint: ["bash", "-c"]
+    command:
+      - >
+        ls -1 apps > sites/apps.txt;
+        bench set-config -g db_host $$DB_HOST;
+        bench set-config -gp db_port 3306;
+        bench set-config -g redis_cache "redis://$$REDIS_HOST/0";
+        bench set-config -g redis_queue "redis://$$REDIS_HOST/1";
+        bench set-config -g redis_socketio "redis://$$REDIS_HOST/1";
+        bench set-config -gp socketio_port 9000;
     environment:
       - DB_HOST=crm-db
-      - REDIS_CACHE=redis://crm-redis:6379/0
-      - REDIS_QUEUE=redis://crm-redis:6379/1
+      - REDIS_HOST=crm-redis:6379
+    volumes:
+      - crm-sites:/home/frappe/frappe-bench/sites
+      - crm-logs:/home/frappe/frappe-bench/logs
+    networks: [branboos-net]
+
+  crm-create-site:
+    image: branboos/crm:latest
+    profiles: ["crm", "ai-chatbot", "full"]
+    depends_on:
+      crm-configurator:
+        condition: service_completed_successfully
+    entrypoint: ["bash", "-c"]
+    command:
+      - >
+        wait-for-it -t 120 crm-db:3306;
+        wait-for-it -t 120 crm-redis:6379;
+        if [ -d "sites/crm.${BASE_DOMAIN}" ]; then
+          echo "CRM site already exists, skipping creation";
+        else
+          bench new-site --mariadb-user-host-login-scope='%'
+            --admin-password="${CRM_ADMIN_PASSWORD:-admin}"
+            --db-root-username=root --db-root-password="${CRM_DB_ROOT_PASSWORD}"
+            --install-app crm --install-app branboos_crm
+            --set-default "crm.${BASE_DOMAIN}";
+        fi
+    environment:
+      - BASE_DOMAIN=${BASE_DOMAIN}
+      - CRM_DB_ROOT_PASSWORD=${CRM_DB_ROOT_PASSWORD}
+      - CRM_ADMIN_PASSWORD=${CRM_ADMIN_PASSWORD:-admin}
+    volumes:
+      - crm-sites:/home/frappe/frappe-bench/sites
+      - crm-logs:/home/frappe/frappe-bench/logs
+    networks: [branboos-net]
+
+  crm-backend:
+    image: branboos/crm:latest
+    profiles: ["crm", "ai-chatbot", "full"]
+    depends_on:
+      crm-create-site:
+        condition: service_completed_successfully
+    volumes:
+      - crm-sites:/home/frappe/frappe-bench/sites
+      - crm-logs:/home/frappe/frappe-bench/logs
+    networks: [branboos-net]
+    restart: unless-stopped
+
+  crm-frontend:
+    image: branboos/crm:latest
+    profiles: ["crm", "ai-chatbot", "full"]
+    depends_on: [crm-backend, crm-websocket]
+    command: ["nginx-entrypoint.sh"]
+    environment:
+      - BACKEND=crm-backend:8000
+      - FRAPPE_SITE_NAME_HEADER=crm.${BASE_DOMAIN}
+      - SOCKETIO=crm-websocket:9000
+      - UPSTREAM_REAL_IP_ADDRESS=127.0.0.1
+      - UPSTREAM_REAL_IP_HEADER=X-Forwarded-For
+      - UPSTREAM_REAL_IP_RECURSIVE=off
+      - PROXY_READ_TIMEOUT=120
+      - CLIENT_MAX_BODY_SIZE=50m
+    volumes:
+      - crm-sites:/home/frappe/frappe-bench/sites
+      - crm-logs:/home/frappe/frappe-bench/logs
     networks: [branboos-net]
     restart: unless-stopped
     labels:
@@ -176,38 +271,60 @@ services:
       - "traefik.http.routers.crm.rule=Host(`crm.${BASE_DOMAIN}`)"
       - "traefik.http.routers.crm.entrypoints=websecure"
       - "traefik.http.routers.crm.tls.certresolver=le"
-      - "traefik.http.services.crm.loadbalancer.server.port=8000"
+      - "traefik.http.services.crm.loadbalancer.server.port=8080"
 
-  crm-worker:
-    image: ghcr.io/branboos/crm:stable
+  crm-queue:
+    image: branboos/crm:latest
     profiles: ["crm", "ai-chatbot", "full"]
-    depends_on: [crm-db, crm-redis]
-    env_file:
-      - path: .env
-        required: false
-    command: ["bench", "worker"]
+    depends_on:
+      crm-create-site:
+        condition: service_completed_successfully
+    command: ["bench", "worker", "--queue", "short,default,long"]
+    volumes:
+      - crm-sites:/home/frappe/frappe-bench/sites
+      - crm-logs:/home/frappe/frappe-bench/logs
     networks: [branboos-net]
     restart: unless-stopped
 
   crm-scheduler:
-    image: ghcr.io/branboos/crm:stable
+    image: branboos/crm:latest
     profiles: ["crm", "ai-chatbot", "full"]
-    depends_on: [crm-db, crm-redis]
-    env_file:
-      - path: .env
-        required: false
+    depends_on:
+      crm-create-site:
+        condition: service_completed_successfully
     command: ["bench", "schedule"]
+    volumes:
+      - crm-sites:/home/frappe/frappe-bench/sites
+      - crm-logs:/home/frappe/frappe-bench/logs
+    networks: [branboos-net]
+    restart: unless-stopped
+
+  crm-websocket:
+    image: branboos/crm:latest
+    profiles: ["crm", "ai-chatbot", "full"]
+    depends_on:
+      crm-create-site:
+        condition: service_completed_successfully
+    command: ["node", "/home/frappe/frappe-bench/apps/frappe/socketio.js"]
+    volumes:
+      - crm-sites:/home/frappe/frappe-bench/sites
+      - crm-logs:/home/frappe/frappe-bench/logs
     networks: [branboos-net]
     restart: unless-stopped
 
   # ── ERP (ERPNext + branboos_erp app) ─────────────────────────────
-  # Same note as CRM: adapt from frappe_docker, this is a skeleton.
+  # Same pattern as CRM above, apps-erp.json bakes in erpnext + branboos-erp.
 
   erp-db:
     image: mariadb:10.6
     profiles: ["erp", "vendor-manager", "full"]
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
     environment:
       - MYSQL_ROOT_PASSWORD=${ERP_DB_ROOT_PASSWORD}
+      - MARIADB_ROOT_PASSWORD=${ERP_DB_ROOT_PASSWORD}
     volumes:
       - erp-db-data:/var/lib/mysql
     networks: [branboos-net]
@@ -221,18 +338,93 @@ services:
     networks: [branboos-net]
     restart: unless-stopped
 
-  erp-web:
-    # build: ./erp   (custom image: frappe/erpnext base + `bench get-app branboos-erp` at build time)
-    image: ghcr.io/branboos/erp:stable   # placeholder — replace with your built image
+  erp-configurator:
+    build:
+      context: ./frappe
+      dockerfile: Containerfile
+      args:
+        FRAPPE_BRANCH: version-16
+      secrets:
+        - source: erp_apps_json
+          target: apps_json
+    image: branboos/erp:latest
     profiles: ["erp", "vendor-manager", "full"]
-    depends_on: [erp-db, erp-redis]
-    env_file:
-      - path: .env
-        required: false
+    entrypoint: ["bash", "-c"]
+    command:
+      - >
+        ls -1 apps > sites/apps.txt;
+        bench set-config -g db_host $$DB_HOST;
+        bench set-config -gp db_port 3306;
+        bench set-config -g redis_cache "redis://$$REDIS_HOST/0";
+        bench set-config -g redis_queue "redis://$$REDIS_HOST/1";
+        bench set-config -g redis_socketio "redis://$$REDIS_HOST/1";
+        bench set-config -gp socketio_port 9000;
     environment:
       - DB_HOST=erp-db
-      - REDIS_CACHE=redis://erp-redis:6379/0
-      - REDIS_QUEUE=redis://erp-redis:6379/1
+      - REDIS_HOST=erp-redis:6379
+    volumes:
+      - erp-sites:/home/frappe/frappe-bench/sites
+      - erp-logs:/home/frappe/frappe-bench/logs
+    networks: [branboos-net]
+
+  erp-create-site:
+    image: branboos/erp:latest
+    profiles: ["erp", "vendor-manager", "full"]
+    depends_on:
+      erp-configurator:
+        condition: service_completed_successfully
+    entrypoint: ["bash", "-c"]
+    command:
+      - >
+        wait-for-it -t 120 erp-db:3306;
+        wait-for-it -t 120 erp-redis:6379;
+        if [ -d "sites/erp.${BASE_DOMAIN}" ]; then
+          echo "ERP site already exists, skipping creation";
+        else
+          bench new-site --mariadb-user-host-login-scope='%'
+            --admin-password="${ERP_ADMIN_PASSWORD:-admin}"
+            --db-root-username=root --db-root-password="${ERP_DB_ROOT_PASSWORD}"
+            --install-app erpnext --install-app branboos_erp
+            --set-default "erp.${BASE_DOMAIN}";
+        fi
+    environment:
+      - BASE_DOMAIN=${BASE_DOMAIN}
+      - ERP_DB_ROOT_PASSWORD=${ERP_DB_ROOT_PASSWORD}
+      - ERP_ADMIN_PASSWORD=${ERP_ADMIN_PASSWORD:-admin}
+    volumes:
+      - erp-sites:/home/frappe/frappe-bench/sites
+      - erp-logs:/home/frappe/frappe-bench/logs
+    networks: [branboos-net]
+
+  erp-backend:
+    image: branboos/erp:latest
+    profiles: ["erp", "vendor-manager", "full"]
+    depends_on:
+      erp-create-site:
+        condition: service_completed_successfully
+    volumes:
+      - erp-sites:/home/frappe/frappe-bench/sites
+      - erp-logs:/home/frappe/frappe-bench/logs
+    networks: [branboos-net]
+    restart: unless-stopped
+
+  erp-frontend:
+    image: branboos/erp:latest
+    profiles: ["erp", "vendor-manager", "full"]
+    depends_on: [erp-backend, erp-websocket]
+    command: ["nginx-entrypoint.sh"]
+    environment:
+      - BACKEND=erp-backend:8000
+      - FRAPPE_SITE_NAME_HEADER=erp.${BASE_DOMAIN}
+      - SOCKETIO=erp-websocket:9000
+      - UPSTREAM_REAL_IP_ADDRESS=127.0.0.1
+      - UPSTREAM_REAL_IP_HEADER=X-Forwarded-For
+      - UPSTREAM_REAL_IP_RECURSIVE=off
+      - PROXY_READ_TIMEOUT=120
+      - CLIENT_MAX_BODY_SIZE=50m
+    volumes:
+      - erp-sites:/home/frappe/frappe-bench/sites
+      - erp-logs:/home/frappe/frappe-bench/logs
     networks: [branboos-net]
     restart: unless-stopped
     labels:
@@ -240,26 +432,43 @@ services:
       - "traefik.http.routers.erp.rule=Host(`erp.${BASE_DOMAIN}`)"
       - "traefik.http.routers.erp.entrypoints=websecure"
       - "traefik.http.routers.erp.tls.certresolver=le"
-      - "traefik.http.services.erp.loadbalancer.server.port=8000"
+      - "traefik.http.services.erp.loadbalancer.server.port=8080"
 
-  erp-worker:
-    image: ghcr.io/branboos/erp:stable
+  erp-queue:
+    image: branboos/erp:latest
     profiles: ["erp", "vendor-manager", "full"]
-    depends_on: [erp-db, erp-redis]
-    env_file:
-      - path: .env
-        required: false
-    command: ["bench", "worker"]
+    depends_on:
+      erp-create-site:
+        condition: service_completed_successfully
+    command: ["bench", "worker", "--queue", "short,default,long"]
+    volumes:
+      - erp-sites:/home/frappe/frappe-bench/sites
+      - erp-logs:/home/frappe/frappe-bench/logs
     networks: [branboos-net]
     restart: unless-stopped
 
   erp-scheduler:
-    image: ghcr.io/branboos/erp:stable
+    image: branboos/erp:latest
     profiles: ["erp", "vendor-manager", "full"]
-    depends_on: [erp-db, erp-redis]
-    env_file:
-      - path: .env
-        required: false
+    depends_on:
+      erp-create-site:
+        condition: service_completed_successfully
     command: ["bench", "schedule"]
+    volumes:
+      - erp-sites:/home/frappe/frappe-bench/sites
+      - erp-logs:/home/frappe/frappe-bench/logs
+    networks: [branboos-net]
+    restart: unless-stopped
+
+  erp-websocket:
+    image: branboos/erp:latest
+    profiles: ["erp", "vendor-manager", "full"]
+    depends_on:
+      erp-create-site:
+        condition: service_completed_successfully
+    command: ["node", "/home/frappe/frappe-bench/apps/frappe/socketio.js"]
+    volumes:
+      - erp-sites:/home/frappe/frappe-bench/sites
+      - erp-logs:/home/frappe/frappe-bench/logs
     networks: [branboos-net]
     restart: unless-stopped
