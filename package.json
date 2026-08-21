@@ -1,0 +1,20 @@
+{
+  "name": "branboos-structura",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Branboos backend services monorepo",
+  "workspaces": [
+    "ai-chatbot",
+    "vendor-manager"
+  ],
+  "scripts": {
+    "dev:ai-chatbot":    "npm run dev --workspace=ai-chatbot",
+    "dev:vendor-manager": "npm run dev --workspace=vendor-manager",
+    "lint":         "npm run lint --workspaces --if-present",
+    "test":         "npm run test --workspaces --if-present",
+    "build":        "npm run build --workspaces --if-present"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,258 @@
+
+# BranBoos Suite — deployment compose file
+# Usage per customer purchase:
+#   Full suite:            docker compose --profile full up -d
+#   Sales bundle:           docker compose --profile ai-chatbot --profile crm up -d
+#   Procurement bundle:     docker compose --profile vendor-manager --profile erp up -d
+#   Single product:         docker compose --profile ai-chatbot up -d   (AI Chatbot alone still needs the AI Gateway)
+
+networks:
+  branboos-net:
+    driver: bridge
+
+volumes:
+  crm-db-data:
+  crm-redis-data:
+  erp-db-data:
+  erp-redis-data:
+  vendor-manager-cache-data:
+  traefik-acme:
+
+services:
+
+  # ── Reverse proxy ────────────────────────────────────────────────
+  reverse-proxy:
+    image: traefik:v3.0
+    profiles: ["ai-chatbot", "vendor-manager", "crm", "erp", "full"]
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.le.acme.email=${TRAEFIK_ACME_EMAIL}"
+      - "--certificatesresolvers.le.acme.storage=/acme.json"
+      - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=web"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik-acme:/acme.json
+    networks: [branboos-net]
+
+  # ── AI Gateway (shared, internal only) ────────────────────────────
+  ai-gateway:
+    build:
+      context: ../ai-gateway
+      dockerfile: Dockerfile
+    profiles: ["ai-chatbot", "vendor-manager", "full"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - KEYSTONE_SERVICE_TOKEN=${KEYSTONE_SERVICE_TOKEN:-}
+    networks: [branboos-net]
+    restart: unless-stopped
+    # Internal only — never expose publicly. No Traefik labels, no ports mapping.
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── AI Chatbot ─────────────────────────────────────────────────
+  ai-chatbot-app:
+    build:
+      context: ../ai-chatbot
+      dockerfile: Dockerfile
+    profiles: ["ai-chatbot", "full"]
+    depends_on:
+      ai-gateway:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - PORT=3000
+      - KEYSTONE_URL=http://ai-gateway:8000
+      - KEYSTONE_SERVICE_TOKEN=${KEYSTONE_SERVICE_TOKEN}
+      - CRM_API_URL=http://crm-web:8000
+      - CRM_API_TOKEN=${CRM_API_TOKEN}
+    networks: [branboos-net]
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.ai-chatbot.rule=Host(`chat.${BASE_DOMAIN}`)"
+      - "traefik.http.routers.ai-chatbot.entrypoints=websecure"
+      - "traefik.http.routers.ai-chatbot.tls.certresolver=le"
+      - "traefik.http.services.ai-chatbot.loadbalancer.server.port=3000"
+
+  # ── Vendor Manager ────────────────────────────────────────────────
+  vendor-manager-app:
+    build:
+      context: ../vendor-manager
+      dockerfile: Dockerfile
+    profiles: ["vendor-manager", "full"]
+    depends_on:
+      ai-gateway:
+        condition: service_healthy
+      vendor-manager-cache:
+        condition: service_started
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - PORT=3000
+      - KEYSTONE_URL=http://ai-gateway:8000
+      - KEYSTONE_SERVICE_TOKEN=${KEYSTONE_SERVICE_TOKEN}
+      - ERP_API_URL=http://erp-web:8000
+      - ERP_API_TOKEN=${ERP_API_TOKEN}
+      - REDIS_URL=redis://vendor-manager-cache:6379
+    networks: [branboos-net]
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.vendor-manager.rule=Host(`vendors.${BASE_DOMAIN}`)"
+      - "traefik.http.routers.vendor-manager.entrypoints=websecure"
+      - "traefik.http.routers.vendor-manager.tls.certresolver=le"
+      - "traefik.http.services.vendor-manager.loadbalancer.server.port=3000"
+
+  vendor-manager-cache:
+    image: redis:7-alpine
+    profiles: ["vendor-manager", "full"]
+    volumes:
+      - vendor-manager-cache-data:/data
+    networks: [branboos-net]
+    restart: unless-stopped
+
+  # ── CRM (Frappe CRM + branboos_crm app) ─────────────────────────
+  # NOTE: adapt from https://github.com/frappe/frappe_docker rather than
+  # building this from scratch — see implementation appendix §5.
+  # This is a minimal skeleton showing the integration points only.
+
+  crm-db:
+    image: mariadb:10.6
+    profiles: ["crm", "ai-chatbot", "full"]
+    environment:
+      - MYSQL_ROOT_PASSWORD=${CRM_DB_ROOT_PASSWORD}
+    volumes:
+      - crm-db-data:/var/lib/mysql
+    networks: [branboos-net]
+    restart: unless-stopped
+
+  crm-redis:
+    image: redis:7-alpine
+    profiles: ["crm", "ai-chatbot", "full"]
+    volumes:
+      - crm-redis-data:/data
+    networks: [branboos-net]
+    restart: unless-stopped
+
+  crm-web:
+    # build: ./crm   (custom image: frappe/crm base + `bench get-app branboos-crm` at build time)
+    image: ghcr.io/branboos/crm:stable   # placeholder — replace with your built image
+    profiles: ["crm", "ai-chatbot", "full"]
+    depends_on: [crm-db, crm-redis]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - DB_HOST=crm-db
+      - REDIS_CACHE=redis://crm-redis:6379/0
+      - REDIS_QUEUE=redis://crm-redis:6379/1
+    networks: [branboos-net]
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.crm.rule=Host(`crm.${BASE_DOMAIN}`)"
+      - "traefik.http.routers.crm.entrypoints=websecure"
+      - "traefik.http.routers.crm.tls.certresolver=le"
+      - "traefik.http.services.crm.loadbalancer.server.port=8000"
+
+  crm-worker:
+    image: ghcr.io/branboos/crm:stable
+    profiles: ["crm", "ai-chatbot", "full"]
+    depends_on: [crm-db, crm-redis]
+    env_file:
+      - path: .env
+        required: false
+    command: ["bench", "worker"]
+    networks: [branboos-net]
+    restart: unless-stopped
+
+  crm-scheduler:
+    image: ghcr.io/branboos/crm:stable
+    profiles: ["crm", "ai-chatbot", "full"]
+    depends_on: [crm-db, crm-redis]
+    env_file:
+      - path: .env
+        required: false
+    command: ["bench", "schedule"]
+    networks: [branboos-net]
+    restart: unless-stopped
+
+  # ── ERP (ERPNext + branboos_erp app) ─────────────────────────────
+  # Same note as CRM: adapt from frappe_docker, this is a skeleton.
+
+  erp-db:
+    image: mariadb:10.6
+    profiles: ["erp", "vendor-manager", "full"]
+    environment:
+      - MYSQL_ROOT_PASSWORD=${ERP_DB_ROOT_PASSWORD}
+    volumes:
+      - erp-db-data:/var/lib/mysql
+    networks: [branboos-net]
+    restart: unless-stopped
+
+  erp-redis:
+    image: redis:7-alpine
+    profiles: ["erp", "vendor-manager", "full"]
+    volumes:
+      - erp-redis-data:/data
+    networks: [branboos-net]
+    restart: unless-stopped
+
+  erp-web:
+    # build: ./erp   (custom image: frappe/erpnext base + `bench get-app branboos-erp` at build time)
+    image: ghcr.io/branboos/erp:stable   # placeholder — replace with your built image
+    profiles: ["erp", "vendor-manager", "full"]
+    depends_on: [erp-db, erp-redis]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - DB_HOST=erp-db
+      - REDIS_CACHE=redis://erp-redis:6379/0
+      - REDIS_QUEUE=redis://erp-redis:6379/1
+    networks: [branboos-net]
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.erp.rule=Host(`erp.${BASE_DOMAIN}`)"
+      - "traefik.http.routers.erp.entrypoints=websecure"
+      - "traefik.http.routers.erp.tls.certresolver=le"
+      - "traefik.http.services.erp.loadbalancer.server.port=8000"
+
+  erp-worker:
+    image: ghcr.io/branboos/erp:stable
+    profiles: ["erp", "vendor-manager", "full"]
+    depends_on: [erp-db, erp-redis]
+    env_file:
+      - path: .env
+        required: false
+    command: ["bench", "worker"]
+    networks: [branboos-net]
+    restart: unless-stopped
+
+  erp-scheduler:
+    image: ghcr.io/branboos/erp:stable
+    profiles: ["erp", "vendor-manager", "full"]
+    depends_on: [erp-db, erp-redis]
+    env_file:
+      - path: .env
+        required: false
+    command: ["bench", "schedule"]
+    networks: [branboos-net]
+    restart: unless-stopped
