@@ -220,11 +220,7 @@ services:
         if [ -d "sites/crm.${BASE_DOMAIN}" ]; then
           echo "CRM site already exists, skipping creation";
         else
-          bench new-site --mariadb-user-host-login-scope='%'
-            --admin-password="${CRM_ADMIN_PASSWORD:-admin}"
-            --db-root-username=root --db-root-password="${CRM_DB_ROOT_PASSWORD}"
-            --install-app crm --install-app branboos_crm
-            --set-default "crm.${BASE_DOMAIN}";
+          bench new-site --mariadb-user-host-login-scope='%' --admin-password="${CRM_ADMIN_PASSWORD:-admin}" --db-root-username=root --db-root-password="${CRM_DB_ROOT_PASSWORD}" --install-app crm --install-app branboos_crm --set-default "crm.${BASE_DOMAIN}";
         fi
     environment:
       - BASE_DOMAIN=${BASE_DOMAIN}
@@ -381,11 +377,7 @@ services:
         if [ -d "sites/erp.${BASE_DOMAIN}" ]; then
           echo "ERP site already exists, skipping creation";
         else
-          bench new-site --mariadb-user-host-login-scope='%'
-            --admin-password="${ERP_ADMIN_PASSWORD:-admin}"
-            --db-root-username=root --db-root-password="${ERP_DB_ROOT_PASSWORD}"
-            --install-app erpnext --install-app branboos_erp
-            --set-default "erp.${BASE_DOMAIN}";
+          bench new-site --mariadb-user-host-login-scope='%' --admin-password="${ERP_ADMIN_PASSWORD:-admin}" --db-root-username=root --db-root-password="${ERP_DB_ROOT_PASSWORD}" --install-app erpnext --install-app branboos_erp --set-default "erp.${BASE_DOMAIN}";
         fi
     environment:
       - BASE_DOMAIN=${BASE_DOMAIN}
