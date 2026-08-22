@@ -50,8 +50,14 @@ async def call_gemini(
         "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": contents,
         "generationConfig": {
-            "maxOutputTokens": 1024,
+            "maxOutputTokens": 2048,
             "temperature": 0.3,
+            # Without this, gemini-3.6-flash's internal "thinking" tokens
+            # count against maxOutputTokens and can consume most of the
+            # budget before the model even starts the visible answer,
+            # truncating short conversational replies mid-sentence. This
+            # task needs a direct answer, not deep reasoning, so disable it.
+            "thinkingConfig": {"thinkingBudget": 0},
         },
     }
 
